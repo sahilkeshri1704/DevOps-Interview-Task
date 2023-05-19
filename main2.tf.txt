@@ -1,0 +1,291 @@
+# Create the new custom dedicated vpc
+
+# Create managementnet network
+ resource "google_compute_network" "load-balanced-vms-network" {
+   name                    = var.network_id
+   project_id              = var.project_id
+   auto_create_subnetworks = false
+ }
+ # Create managementsubnet-us subnetwork
+resource "google_compute_subnetwork" "load-balanced-vms-network-subnet1" {
+  name          = var.subnet_self_link
+  region        = var.region
+  ip_cidr_range = var.ip_cidr_range
+  network       = google_compute_network.managementnet.self_link
+  
+}
+# Create a firewall rule to allow HTTP, SSH, RDP and ICMP traffic on managementnet
+resource "google_compute_firewall" "load-balanced-vms_allow_firewall" {
+  name    = var.firewall-rule
+  project = var.project_id
+  source_ranges = ["0.0.0.0/0"]
+  target_tags = ["private-ssh"]
+  network = google_compute_network.managementnet.self_link
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "80", "3389","443"]
+  }
+  allow {
+    protocol = "icmp"
+  }
+}
+
+#************** Create a VM ******************
+
+resource "google_compute_instance" "exemplar" {
+  name         = var.instance_name
+  machine_type = local.exemplar_machine_type
+  region        = var.region
+  zone         = var.zone
+  project      = var.project_id
+  labels       = var.labels
+  custom_network = var.network_id
+  tags         = ["http-server", "private-ssh"]
+  lb_endpoint  = "http://${module.gce-lb-http.external_ip}/"
+  metadata_startup_script = <<EOF
+apt-get update -y
+apt-get install nginx -y
+printf '${data.local_file.index.content}'  | tee /var/www/html/index.html
+chgrp root /var/www/html/index.html
+chown root /var/www/html/index.html
+chmod +r /var/www/html/index.html
+sleep 300
+shutdown -h now
+EOF
+
+  boot_disk {
+    auto_delete = true
+    device_name = "${var.deployment_name}-exemplar"
+    initialize_params {
+      image = "family/debian-10"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork         = local.subnet_self_link
+    subnetwork_project = local.network_project_id
+    access_config {
+      // Ephemeral public IP
+    }
+  }
+}
+
+resource "time_sleep" "startup_completion" {
+  create_duration = "120s"
+  depends_on      = [google_compute_instance.exemplar]
+}
+
+
+# ***********Create Sql instance********
+
+resource "google_sql_database_instance" "master" {
+  name                 = var.sqlinstance_name
+  project              = var.project_id
+  region               = var.region
+  database_version     = var.database_version
+  master_instance_name = var.master_instance_name
+
+  settings {
+    tier                        = var.tier
+    activation_policy           = var.activation_policy
+    authorized_gae_applications = var.authorized_gae_applications
+    disk_autoresize             = var.disk_autoresize
+    dynamic "backup_configuration" {
+      for_each = [var.backup_configuration]
+      content {
+
+        binary_log_enabled = lookup(backup_configuration.value, "binary_log_enabled", null)
+        enabled            = lookup(backup_configuration.value, "enabled", null)
+        start_time         = lookup(backup_configuration.value, "start_time", null)
+      }
+    }
+    dynamic "ip_configuration" {
+      for_each = [var.ip_configuration]
+      content {
+
+        ipv4_enabled    = lookup(ip_configuration.value, "ipv4_enabled", true)
+        private_network = lookup(ip_configuration.value, "private_network", null)
+        require_ssl     = lookup(ip_configuration.value, "require_ssl", null)
+
+        dynamic "authorized_networks" {
+          for_each = lookup(ip_configuration.value, "authorized_networks", [])
+          content {
+            expiration_time = lookup(authorized_networks.value, "expiration_time", null)
+            name            = lookup(authorized_networks.value, "name", null)
+            value           = lookup(authorized_networks.value, "value", null)
+          }
+        }
+      }
+    }
+    dynamic "location_preference" {
+      for_each = [var.location_preference]
+      content {
+
+        follow_gae_application = lookup(location_preference.value, "follow_gae_application", null)
+        zone                   = lookup(location_preference.value, "zone", null)
+      }
+    }
+    dynamic "maintenance_window" {
+      for_each = [var.maintenance_window]
+      content {
+
+        day          = lookup(maintenance_window.value, "day", null)
+        hour         = lookup(maintenance_window.value, "hour", null)
+        update_track = lookup(maintenance_window.value, "update_track", null)
+      }
+    }
+    disk_size        = var.disk_size
+    disk_type        = var.disk_type
+    pricing_plan     = var.pricing_plan
+    replication_type = var.replication_type
+    availability_type = var.availability_type
+  }
+
+  dynamic "replica_configuration" {
+    for_each = [var.replica_configuration]
+    content {
+
+      ca_certificate            = lookup(replica_configuration.value, "ca_certificate", null)
+      client_certificate        = lookup(replica_configuration.value, "client_certificate", null)
+      client_key                = lookup(replica_configuration.value, "client_key", null)
+      connect_retry_interval    = lookup(replica_configuration.value, "connect_retry_interval", null)
+      dump_file_path            = lookup(replica_configuration.value, "dump_file_path", null)
+      failover_target           = lookup(replica_configuration.value, "failover_target", null)
+      master_heartbeat_period   = lookup(replica_configuration.value, "master_heartbeat_period", null)
+      password                  = lookup(replica_configuration.value, "password", null)
+      ssl_cipher                = lookup(replica_configuration.value, "ssl_cipher", null)
+      username                  = lookup(replica_configuration.value, "username", null)
+      verify_server_certificate = lookup(replica_configuration.value, "verify_server_certificate", null)
+    }
+  }
+
+  timeouts {
+    create = "60m"
+    delete = "2h"
+  }
+}
+
+resource "google_sql_database" "default" {
+  count     = var.master_instance_name == "" ? 1 : 0
+  name      = var.db_name
+  project   = var.project_id
+  instance  = google_sql_database_instance.master.name
+  charset   = var.db_charset
+  collation = var.db_collation
+}
+
+resource "random_id" "user-password" {
+  byte_length = 8
+}
+
+resource "google_sql_user" "default" {
+  count    = var.master_instance_name == "" ? 1 : 0
+  name     = var.user_name
+  project  = var.project_id
+  instance = google_sql_database_instance.master.name
+  host     = var.user_host
+  password = var.user_password == "" ? random_id.user-password.hex : var.user_password
+}
+
+#******** Cloud Build *********
+
+touch cloudbuild-tf-apply.yaml
+
+timeout: 1200s
+steps:
+# terraform init -input=false
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - init
+  - -input=false
+# terraform validate
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - validate
+# terraform plan -input=false -out=tfplan
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - plan
+  - -input=false
+  - -out=tfplan
+# terraform apply -auto-approve -input=false tfplan
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - apply
+  - -auto-approve
+  - -input=false
+  - tfplan
+artifacts:
+  objects:
+    location: 'gs://${_ARTIFACT_BUCKET_NAME}/terraform/cloudbuild/apply/$BUILD_ID'
+    paths: ['cloudbuild-tf-apply.yaml', 'tfplan']
+	
+
+#  touch cloudbuild-tf-plan.yaml
+
+timeout: 1200s
+steps:
+# terraform init -input=false
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - init
+  - -input=false
+# terraform validate
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - validate
+# terraform plan -input=false -out=tfplan
+- name: gcr.io/$PROJECT_ID/terraform
+  args:
+  - plan
+  - -input=false
+  - -out=tfplan
+artifacts:
+  objects:
+    location: 'gs://${_ARTIFACT_BUCKET_NAME}/terraform/cloudbuild/plan/$BUILD_ID'
+    paths: ['cloudbuild-tf-plan.yaml', 'tfplan']
+
+#  
+
+module "seed_trigger" {
+  source                  = "../.."
+  org_id                  = var.org_id
+  billing_account         = var.billing_account
+  group_org_admins        = var.group_org_admins
+  group_billing_admins    = var.group_billing_admins
+  default_region          = var.region
+  org_project_creators    = var.org_project_creators
+  sa_enable_impersonation = true
+  project_prefix          = var.project_prefix
+}
+
+module "cloudbuild_trigger" {
+  source                  = "../../modules/cloudbuild"
+  org_id                  = var.org_id
+  billing_account         = var.billing_account
+  group_org_admins        = var.group_org_admins
+  default_region          = var.region
+  sa_enable_impersonation = true
+  terraform_sa_email      = module.seed_bootstrap.terraform_sa_email
+  terraform_sa_name       = module.seed_bootstrap.terraform_sa_name
+  terraform_state_bucket  = module.seed_bootstrap.gcs_bucket_tfstate
+  project_prefix          = var.project_prefix
+}
+
+#**Set up the load balancer
+
+  resource "google_compute_health_check" "default" {
+  name               = "load-balanced-vms-check"
+  check_interval_sec = 5
+  healthy_threshold  = 2
+  http_health_check {
+    port               = 80
+    port_specification = "USE_FIXED_PORT"
+    proxy_header       = "NONE"
+    request_path       = "/"
+  }
+  timeout_sec         = 5
+  unhealthy_threshold = 2
+}
